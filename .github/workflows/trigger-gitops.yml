@@ -1,0 +1,64 @@
+name: Trigger GitOps
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**']
+  workflow_dispatch:
+
+jobs:
+  sync-to-gitops:
+    name: Sync Changes to GitOps Branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "gitops@github.com"
+          git config --local user.name "GitOps Sync Bot"
+
+      - name: Sync changes to gitops branch
+        run: |
+          echo "🔄 Syncing changes from main to gitops branch..."
+          
+          # Check if gitops branch exists
+          if git show-ref --verify --quiet refs/remotes/origin/gitops; then
+            echo "✅ GitOps branch exists, checking out..."
+            git checkout gitops
+            git pull origin gitops
+          else
+            echo "📝 Creating gitops branch from main..."
+            git checkout -b gitops
+          fi
+          
+          # Merge changes from main
+          echo "🔀 Merging changes from main..."
+          git merge origin/main --no-edit || {
+            echo "❌ Merge conflict detected. Manual resolution required."
+            exit 1
+          }
+          
+          # Push to gitops branch
+          echo "📤 Pushing to gitops branch..."
+          git push origin gitops
+          
+          echo "✅ Successfully synced changes to gitops branch"
+          echo "🚀 GitOps deployment workflow will now trigger automatically"
+
+      - name: Summary
+        run: |
+          echo "# 🔄 GitOps Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Changes synced from main to gitops branch**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Branch**: main" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Branch**: gitops" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🚀 **Next**: GitOps deployment workflow will automatically trigger on gitops branch"
