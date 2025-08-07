@@ -1,4 +1,4 @@
-name: Deploy
+name: Build and Deploy
 
 on:
   push:
@@ -8,6 +8,7 @@ on:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
 
 jobs:
   detect-changes:
@@ -48,40 +49,35 @@ jobs:
           
           # Check if we have any changes
           if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
-            echo "❌ No services changed"
             echo "has-changes=false" >> $GITHUB_OUTPUT
-            exit 0
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            echo "changed-services=" >> $GITHUB_OUTPUT
+            echo "ℹ️ No changes detected in any services"
+          else
+            # Create matrix for parallel jobs
+            MATRIX_JSON=$(printf '%s\n' "${CHANGED_SERVICES[@]}" | jq -R . | jq -s 'map({service: .})')
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "matrix={\"include\":$MATRIX_JSON}" >> $GITHUB_OUTPUT
+            echo "changed-services=${CHANGED_SERVICES[*]}" >> $GITHUB_OUTPUT
+            echo "🚀 Will process services: ${CHANGED_SERVICES[*]}"
           fi
-          
-          # Create matrix for changed services only
-          MATRIX_JSON="["
-          for i in "${!CHANGED_SERVICES[@]}"; do
-            if [ $i -gt 0 ]; then
-              MATRIX_JSON+=","
-            fi
-            MATRIX_JSON+="\"${CHANGED_SERVICES[$i]}\""
-          done
-          MATRIX_JSON+="]"
-          
-          echo "changed-services=${CHANGED_SERVICES[*]}" >> $GITHUB_OUTPUT
-          echo "matrix={\"service\":$MATRIX_JSON}" >> $GITHUB_OUTPUT
-          echo "has-changes=true" >> $GITHUB_OUTPUT
-          
-          echo "📊 Services to build: ${CHANGED_SERVICES[*]}"
-          echo "📊 Generated matrix: {\"service\":$MATRIX_JSON}"
 
-  deploy:
-    name: Deploy ${{ matrix.service }}
+  build-and-push:
+    name: Build & Push ${{ matrix.service }}
     runs-on: ubuntu-latest
     needs: detect-changes
     if: needs.detect-changes.outputs.has-changes == 'true'
-    permissions:
-      contents: write
     strategy:
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
       fail-fast: false
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -90,83 +86,84 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push ${{ matrix.service }}
+      - name: Build, tag, and push Docker image
+        env:
+          ECR_REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          ECR_REPOSITORY: retail-store-${{ matrix.service }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           SERVICE="${{ matrix.service }}"
-          TAG="$(echo ${{ github.sha }} | cut -c1-7)"
-          AWS_ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
-          ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/retail-store-${SERVICE}"
+          SHORT_TAG="$(echo ${{ github.sha }} | cut -c1-7)"
           
-          echo "🔨 Building ${SERVICE}:${TAG}"
+          echo "🏗️ Building ${SERVICE} service..."
+          echo "📦 Repository: $ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "🏷️ Tags: $IMAGE_TAG, $SHORT_TAG, latest"
           
-          # Create ECR repo if it doesn't exist
-          aws ecr describe-repositories --repository-names "retail-store-${SERVICE}" 2>/dev/null || \
-          aws ecr create-repository --repository-name "retail-store-${SERVICE}" \
-            --image-scanning-configuration scanOnPush=true \
-            --encryption-configuration encryptionType=AES256
+          # Create ECR repository if it doesn't exist
+          echo "🔍 Checking if ECR repository exists..."
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || {
+            echo "📝 Creating ECR repository: $ECR_REPOSITORY"
+            aws ecr create-repository --repository-name $ECR_REPOSITORY
+          }
           
-          # Build and push
-          docker build -t "${ECR_REPO}:${TAG}" -t "${ECR_REPO}:latest" "src/${SERVICE}/"
-          docker push "${ECR_REPO}:${TAG}"
-          docker push "${ECR_REPO}:latest"
+          # Build Docker image
+          echo "🔨 Building Docker image..."
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG src/$SERVICE/
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_TAG src/$SERVICE/
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest src/$SERVICE/
           
-          echo "✅ Pushed ${ECR_REPO}:${TAG}"
-          echo "ECR_REPO=${ECR_REPO}" >> $GITHUB_ENV
+          # Push images
+          echo "📤 Pushing images to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          echo "✅ Successfully built and pushed ${SERVICE}"
+          echo "🔗 Image URI: $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_TAG"
 
       - name: Update Helm values for ${{ matrix.service }}
+        env:
+          SERVICE: ${{ matrix.service }}
+          ECR_REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
         run: |
-          SERVICE="${{ matrix.service }}"
-          TAG="$(echo ${{ github.sha }} | cut -c1-7)"
-          ECR_REPO="${{ env.ECR_REPO }}"
           VALUES_FILE="src/${SERVICE}/chart/values.yaml"
+          TAG="$(echo ${{ github.sha }} | cut -c1-7)"
+          IMAGE_URI="${ECR_REGISTRY}/retail-store-${SERVICE}"
           
-          echo "📝 Updating Helm values for ${SERVICE}"
-          echo "   Repository: ${ECR_REPO}"
-          echo "   Tag: ${TAG}"
-          echo "   File: ${VALUES_FILE}"
+          echo "📝 Updating Helm values for ${SERVICE}..."
+          echo "📄 File: $VALUES_FILE"
+          echo "🏷️ New tag: $TAG"
+          echo "🖼️ Image: $IMAGE_URI"
           
-          # Validate file exists
-          if [[ ! -f "${VALUES_FILE}" ]]; then
-            echo "❌ Values file not found: ${VALUES_FILE}"
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "❌ Values file not found: $VALUES_FILE"
             exit 1
           fi
           
-          # Show before state
-          echo "📋 Before update (main service image):"
-          grep -A3 "^image:" "${VALUES_FILE}" | head -4 || echo "No main image section found"
+          # Backup original file
+          cp "$VALUES_FILE" "${VALUES_FILE}.backup"
           
-          # Create a backup
-          cp "${VALUES_FILE}" "${VALUES_FILE}.backup"
+          # Update image repository and tag
+          if grep -q "repository:" "$VALUES_FILE"; then
+            sed -i "s|repository:.*|repository: \"$IMAGE_URI\"|" "$VALUES_FILE"
+            echo "✅ Updated repository to: $IMAGE_URI"
+          fi
           
-          # Update only the main service image (first occurrence under 'image:' section)
-          # This preserves infrastructure component images (mysql, redis, postgresql, rabbitmq, dynamodb)
-          awk -v repo="${ECR_REPO}" -v tag="${TAG}" '
-          BEGIN { in_main_image = 0; updated_repo = 0; updated_tag = 0 }
-          /^image:/ { in_main_image = 1; print; next }
-          in_main_image && /^[[:space:]]*repository:/ && !updated_repo { 
-            print "  repository: " repo; updated_repo = 1; next 
-          }
-          in_main_image && /^[[:space:]]*tag:/ && !updated_tag { 
-            print "  tag: \"" tag "\""; updated_tag = 1; next 
-          }
-          /^[a-zA-Z]/ && !/^image:/ { in_main_image = 0 }
-          { print }
-          ' "${VALUES_FILE}.backup" > "${VALUES_FILE}"
+          if grep -q "tag:" "$VALUES_FILE"; then
+            sed -i "s/tag:.*/tag: \"$TAG\"/" "$VALUES_FILE"
+            echo "✅ Updated tag to: $TAG"
+          fi
           
-          # Validate the update worked
-          if grep -q "${ECR_REPO}" "${VALUES_FILE}" && grep -q "\"${TAG}\"" "${VALUES_FILE}"; then
-            echo "✅ Successfully updated ${VALUES_FILE}"
-            echo "📋 After update (main service image):"
-            grep -A3 "^image:" "${VALUES_FILE}" | head -4
-            
-            # Show that infrastructure images are preserved
-            echo "🔒 Infrastructure images preserved:"
-            grep -A1 "repository:" "${VALUES_FILE}" | grep -E "(mysql|redis|postgres|rabbitmq|dynamodb-local)" || echo "No infrastructure images found"
-          else
+          # Verify changes
+          echo "📋 Updated values.yaml content:"
+          cat "$VALUES_FILE"
+          
+          # Check if update was successful
+          if ! grep -q "$TAG" "$VALUES_FILE"; then
             echo "❌ Update failed - restoring backup"
             mv "${VALUES_FILE}.backup" "${VALUES_FILE}"
             exit 1
@@ -174,27 +171,38 @@ jobs:
           
           # Remove backup
           rm "${VALUES_FILE}.backup"
+          echo "✅ Helm values updated successfully"
 
-      - name: Commit Helm changes for ${{ matrix.service }}
+      - name: Commit and push Helm changes to main
+        env:
+          SERVICE: ${{ matrix.service }}
         run: |
-          SERVICE="${{ matrix.service }}"
           TAG="$(echo ${{ github.sha }} | cut -c1-7)"
           
           git config --local user.email "gitops@github.com"
           git config --local user.name "GitOps Bot"
           
+          # Check if there are changes to commit
           if ! git diff --quiet "src/${SERVICE}/chart/values.yaml"; then
-            git add "src/${SERVICE}/chart/values.yaml"
-            git commit -m "🚀 Update ${SERVICE} Helm chart to ${TAG} - ECR: retail-store-${SERVICE} - Commit: ${{ github.sha }}"
+            echo "📝 Committing Helm changes for ${SERVICE}..."
             
-            # Push with retry logic
+            git add "src/${SERVICE}/chart/values.yaml"
+            git commit -m "🚀 Update ${SERVICE} Helm chart to ${TAG}
+
+- ECR Repository: retail-store-${SERVICE}
+- Image Tag: ${TAG}
+- Full SHA: ${{ github.sha }}
+- Triggered by: ${{ github.actor }}"
+            
+            # Push with retry logic to main branch
             for i in {1..3}; do
-              if git push origin gitops; then
-                echo "✅ Successfully pushed Helm update for ${SERVICE}"
+              echo "📤 Pushing changes to main branch (attempt $i/3)..."
+              if git push origin main; then
+                echo "✅ Successfully pushed Helm update for ${SERVICE} to main"
                 break
               else
                 echo "⚠️ Push failed for ${SERVICE}, attempt $i/3. Retrying..."
-                git pull --rebase origin gitops
+                git pull --rebase origin main
                 sleep 2
               fi
               
@@ -210,34 +218,43 @@ jobs:
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [detect-changes, deploy]
+    needs: [detect-changes, build-and-push]
     if: always()
     steps:
-      - name: Create deployment summary
+      - name: Generate deployment summary
         run: |
-          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Branch:** gitops" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ needs.detect-changes.outputs.has-changes }}" == "true" ]; then
-            echo "**Changed Services:** ${{ needs.detect-changes.outputs.changed-services }}" >> $GITHUB_STEP_SUMMARY
+            echo "## ✅ Successfully Processed Services" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
-            if [ "${{ needs.deploy.result }}" == "success" ]; then
-              echo "✅ **Status:** Deployment successful" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Actions completed:**" >> $GITHUB_STEP_SUMMARY
-              echo "- 🔨 Built and pushed Docker images to ECR" >> $GITHUB_STEP_SUMMARY
-              echo "- 📝 Updated Helm chart values" >> $GITHUB_STEP_SUMMARY
-              echo "- 💾 Committed changes to repository" >> $GITHUB_STEP_SUMMARY
-              echo "- 🔄 ArgoCD will sync automatically" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "❌ **Status:** Deployment failed" >> $GITHUB_STEP_SUMMARY
-              echo "Check the workflow logs for details" >> $GITHUB_STEP_SUMMARY
-            fi
+            IFS=' ' read -ra SERVICES <<< "${{ needs.detect-changes.outputs.changed-services }}"
+            for service in "${SERVICES[@]}"; do
+              echo "- **${service}**: Built and pushed to ECR, Helm values updated" >> $GITHUB_STEP_SUMMARY
+            done
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 📦 Deployment Details" >> $GITHUB_STEP_SUMMARY
+            echo "- **ECR Registry**: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_STEP_SUMMARY
+            echo "- **Image Tag**: $(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Branch**: main" >> $GITHUB_STEP_SUMMARY
+            echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 🔄 Next Steps" >> $GITHUB_STEP_SUMMARY
+            echo "- ArgoCD will automatically sync the updated Helm charts" >> $GITHUB_STEP_SUMMARY
+            echo "- Monitor deployment status in ArgoCD UI" >> $GITHUB_STEP_SUMMARY
+            echo "- Verify application health in Kubernetes cluster" >> $GITHUB_STEP_SUMMARY
           else
-            echo "ℹ️ **Status:** No services changed - no deployment needed" >> $GITHUB_STEP_SUMMARY
+            echo "## ℹ️ No Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No changes were detected in the service source code." >> $GITHUB_STEP_SUMMARY
+            echo "Deployment was skipped." >> $GITHUB_STEP_SUMMARY
           fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by GitOps workflow on $(date)*" >> $GITHUB_STEP_SUMMARY
